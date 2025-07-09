@@ -1,12 +1,15 @@
 package br.edu.ifrs.riogrande.tads.ppa.service;
 
+import br.edu.ifrs.riogrande.tads.ppa.config.RabbitMQConfig;
 import br.edu.ifrs.riogrande.tads.ppa.model.NewUser;
+import br.edu.ifrs.riogrande.tads.ppa.model.NewUserEvent;
 import br.edu.ifrs.riogrande.tads.ppa.model.Profile;
 import br.edu.ifrs.riogrande.tads.ppa.model.Role;
 import br.edu.ifrs.riogrande.tads.ppa.model.User;
 import br.edu.ifrs.riogrande.tads.ppa.repository.RoleRepository;
 import br.edu.ifrs.riogrande.tads.ppa.repository.UserRepository;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,18 +22,21 @@ public class UserService {
 
     private final UserRepository userRepository;
     private final RoleRepository roleRepository;
-    private final BCryptPasswordEncoder passwordEncoder;
+    private final PasswordEncoder passwordEncoder;
     private final Set<String> defaultRoles;
+    private final RabbitTemplate rabbitTemplate;
 
     public UserService(
             UserRepository userRepository,
             RoleRepository roleRepository,
-            BCryptPasswordEncoder passwordEncoder,
-            Set<String> defaultRoles) {
+            PasswordEncoder passwordEncoder,
+            Set<String> defaultRoles,
+            RabbitTemplate rabbitTemplate) {
         this.userRepository = userRepository;
         this.roleRepository = roleRepository;
         this.passwordEncoder = passwordEncoder;
         this.defaultRoles = defaultRoles;
+        this.rabbitTemplate = rabbitTemplate;
     }
 
     @Transactional
@@ -42,14 +48,14 @@ public class UserService {
         user.setHandle(newUser.handle() != null ? newUser.handle() : generateHandle(newUser.email()));
         user.setPassword(passwordEncoder.encode(newUser.password()));
 
-        Set<Role> roles = new HashSet<>(roleRepository.findByNameIn(defaultRoles));
-        Set<Role> additionalRoles = roleRepository.findByNameIn(newUser.roles());
-        
-        if (additionalRoles.size() != newUser.roles().size()) {
-            throw new IllegalArgumentException("Alguns papéis não existem");
+        Set<Role> roles = new HashSet<>();
+        if (newUser.roles() != null && !newUser.roles().isEmpty()) {
+            Set<Role> foundRoles = roleRepository.findByNameIn(newUser.roles());
+            if (foundRoles.size() != newUser.roles().size()) {
+                throw new IllegalArgumentException("Alguns papéis não existem");
+            }
+            roles.addAll(foundRoles);
         }
-        
-        roles.addAll(additionalRoles);
         user.setRoles(roles);
 
         Profile profile = new Profile();
@@ -59,34 +65,43 @@ public class UserService {
         profile.setUser(user);
         user.setProfile(profile);
 
-        return userRepository.save(user);
+        User savedUser = userRepository.save(user);
+
+        NewUserEvent event = new NewUserEvent(
+            savedUser.getId(),
+            savedUser.getProfile().getName(),
+            savedUser.getHandle(),
+            savedUser.getEmail(),
+            savedUser.getProfile().getCompany(),
+            savedUser.getRoles().stream().map(Role::getName).toList()
+        );
+
+        System.out.println(">>> Enviando NewUserEvent para o Exchange '" + RabbitMQConfig.USER_EXCHANGE + "': " + event);
+        rabbitTemplate.convertAndSend(RabbitMQConfig.USER_EXCHANGE, RabbitMQConfig.ROUTING_KEY, event);
+
+        return savedUser;
     }
 
     private void validateNewUser(NewUser newUser) {
         if (newUser.email() == null || newUser.password() == null) {
             throw new IllegalArgumentException("Email e senha são obrigatórios");
         }
-
         if (newUser.email().isEmpty() || newUser.password().isEmpty()) {
             throw new IllegalArgumentException("Email e senha não podem estar vazios");
         }
-
         if (!newUser.email().matches("^[A-Za-z0-9+_.-]+@(.+)$")) {
-            throw new IllegalArgumentException("Email não é válido");
+            throw new IllegalArgumentException("Email inválido");
         }
-
         if (!newUser.password().matches("^(?=.*[0-9])(?=.*[a-zA-Z]).{8,}$")) {
             throw new IllegalArgumentException("A senha deve ter pelo menos 8 caracteres e conter pelo menos uma letra e um número");
         }
-
         userRepository.findByEmail(newUser.email())
-                .ifPresent(user -> {
+                .ifPresent(u -> {
                     throw new IllegalArgumentException("Usuário com o email " + newUser.email() + " já existe");
                 });
-
         if (newUser.handle() != null) {
             userRepository.findByHandle(newUser.handle())
-                    .ifPresent(user -> {
+                    .ifPresent(u -> {
                         throw new IllegalArgumentException("Usuário com o nome " + newUser.handle() + " já existe");
                     });
         }
